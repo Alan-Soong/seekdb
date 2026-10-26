@@ -158,6 +158,44 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+// Returns true when the token may need case folding. Tokens made only of
+// caseless scripts (CJK ideographs / kana / hangul / CJK punctuation) and
+// lowercase ascii skip the copy+fold entirely.
+static bool ft_word_needs_casedown(const char *ptr, const int64_t len)
+{
+  bool need = false;
+  for (int64_t i = 0; !need && i < len;) {
+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
+    if (c < 0x80) {
+      if (c >= 'A' && c <= 'Z') {
+        need = true;
+      }
+      ++i;
+    } else {
+      uint32_t cp = 0;
+      int64_t n = 0;
+      if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 2; }
+      else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 3; }
+      else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 4; }
+      else { need = true; break; }
+      if (i + n > len) { need = true; break; }
+      for (int64_t k = 1; k < n; ++k) {
+        cp = (cp << 6) | (static_cast<unsigned char>(ptr[i + k]) & 0x3F);
+      }
+      i += n;
+      const bool caseless = (cp >= 0x2E80 && cp <= 0x9FFF)   // CJK radicals + ideographs
+                         || (cp >= 0x3040 && cp <= 0x30FF)   // hiragana + katakana
+                         || (cp >= 0xAC00 && cp <= 0xD7AF)   // hangul syllables
+                         || (cp >= 0xF900 && cp <= 0xFAFF)   // CJK compatibility ideographs
+                         || (cp >= 0x3000 && cp <= 0x303F);  // CJK punctuation
+      if (!caseless) {
+        need = true;
+      }
+    }
+  }
+  return need;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
@@ -165,7 +203,10 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
     ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
+    const ObString src_str = src.get_word().get_string();
+    if (!ft_word_needs_casedown(src_str.ptr(), src_str.length())) {
+      dst = src;
+    } else if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
                     src.get_word().get_string(),
                     dst_str,
@@ -204,14 +245,16 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    // Fast path: most tokens are unique inside one document, so try the insert
+    // first and only pay for the read-modify-write when the token already exists.
+    int tmp_ret = word_map_.set_refactored(word, 1/*word count*/);
+    if (OB_SUCCESS == tmp_ret) {
+      // inserted
+    } else if (OB_HASH_EXIST != tmp_ret) {
+      ret = tmp_ret;
+    } else if (OB_FAIL(word_map_.get_refactored(word, word_count))) {
+    } else if (OB_FAIL(word_map_.set_refactored(word, word_count + word_freq, 1/*overwrite*/))) {
     }
   }
   return ret;
